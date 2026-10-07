@@ -16,6 +16,11 @@ statements so one ordered migration chain can run on disposable PostgreSQL.
 It preserves literals, comments and quoted identifiers. See
 `database/pgx/v5/README.md` for the supported scope and limitations.
 
+The fork also fixes validity checks for skipped async indexes whose target table
+is in a different schema from migration metadata. Explicit table qualifiers are
+used to locate the index, and an unresolved index fails rather than being marked
+clean. A live regression test covers valid and failed unique indexes across schemas.
+
 Checks:
 
 ```

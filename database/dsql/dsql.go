@@ -1010,9 +1010,24 @@ func indexNameFromIfNotExists(statement string) string {
 	return strings.ToLower(match[1])
 }
 
-// indexValidityQuery reads whether a named index in the driver's schema is valid. The schema is
-// named rather than left to search_path, which carries x-migrations-schema only when the URL sets
-// search_path too (see poolConfigFor); an index on a table in another schema leaves no row.
+// Indexes live in the table's schema, which can differ from the migration
+// bookkeeping schema. Resolve an explicit table qualifier before checking a
+// skipped IF NOT EXISTS index; Todo uses public metadata and glasswaves_auth data.
+var asyncIndexTableSchemaPattern = regexp.MustCompile(
+	`(?is)^CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\s+IF\s+NOT\s+EXISTS\s+(?:"(?:[^"]|"")+"|[^\s("]+)\s+ON\s+(?:ONLY\s+)?("(?:[^"]|"")+"|[^\s.("]+)\s*\.`)
+
+func indexSchemaFromIfNotExists(statement string) string {
+	match := asyncIndexTableSchemaPattern.FindStringSubmatch(strings.TrimLeft(replaceComments(statement), " \t\r\n"))
+	if match == nil {
+		return ""
+	}
+	if name, quoted := strings.CutPrefix(match[1], `"`); quoted {
+		return strings.ReplaceAll(strings.TrimSuffix(name, `"`), `""`, `"`)
+	}
+	return strings.ToLower(match[1])
+}
+
+// indexValidityQuery reads whether the named index in the target table's schema is valid.
 const indexValidityQuery = `SELECT i.indisvalid FROM pg_index i ` +
 	`JOIN pg_class c ON c.oid = i.indexrelid ` +
 	`JOIN pg_namespace n ON n.oid = c.relnamespace ` +
@@ -1025,13 +1040,17 @@ const indexValidityQuery = `SELECT i.indisvalid FROM pg_index i ` +
 // that works and for one that only occupies its name; this separates them, leaving the re-run of a
 // failed migration something to act on.
 //
-// A name resolving to nothing is left alone — the index is in another schema, or something moved
-// underneath the statement — and the tolerant reading is the useful one.
+// If the index cannot be resolved, fail rather than recording an unverified
+// migration as clean. Explicitly qualify tables when using a separate metadata schema.
 func (d *DSQL) confirmIndexIsValid(ctx context.Context, name, statement string) error {
+	schema := indexSchemaFromIfNotExists(statement)
+	if schema == "" {
+		schema = d.config.SchemaName
+	}
 	var valid bool
-	if err := d.db.QueryRowContext(ctx, indexValidityQuery, name, d.config.SchemaName).Scan(&valid); err != nil {
+	if err := d.db.QueryRowContext(ctx, indexValidityQuery, name, schema).Scan(&valid); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+			return fmt.Errorf("dsql: cannot verify skipped index %s in schema %s; qualify its target table", name, schema)
 		}
 		// Unwrapped: inside the retried unit a database.Error hides the *pgconn.PgError from
 		// IsOCCError, and a catalog read just after a CREATE INDEX is where an OC001 lands. The
