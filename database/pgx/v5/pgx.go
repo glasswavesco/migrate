@@ -3,6 +3,7 @@
 package pgx
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -49,6 +50,7 @@ type Config struct {
 	migrationsTableName   string
 	StatementTimeout      time.Duration
 	MigrationsTableQuoted bool
+	DSQLCompatibility     bool
 	MultiStatementEnabled bool
 	MultiStatementMaxSize int
 }
@@ -192,7 +194,16 @@ func (p *Postgres) Open(url string) (database.Driver, error) {
 		}
 	}
 
+	dsqlCompatibility := false
+	if s := purl.Query().Get("x-dsql-compatibility"); s != "" {
+		dsqlCompatibility, err = strconv.ParseBool(s)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse option x-dsql-compatibility: %w", err)
+		}
+	}
+
 	px, err := WithInstance(db, &Config{
+		DSQLCompatibility:     dsqlCompatibility,
 		DatabaseName:          purl.Path,
 		MigrationsTable:       migrationsTable,
 		MigrationsTableQuoted: migrationsTableQuoted,
@@ -250,6 +261,17 @@ func (p *Postgres) Unlock() error {
 }
 
 func (p *Postgres) Run(migration io.Reader) error {
+	if p.config.DSQLCompatibility {
+		input, err := io.ReadAll(migration)
+		if err != nil {
+			return err
+		}
+		output, err := postgresDSQL(input)
+		if err != nil {
+			return err
+		}
+		migration = bytes.NewReader(output)
+	}
 	if p.config.MultiStatementEnabled {
 		var err error
 		if e := multistmt.Parse(migration, multiStmtDelimiter, p.config.MultiStatementMaxSize, func(m []byte) bool {

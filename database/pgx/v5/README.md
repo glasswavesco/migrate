@@ -6,6 +6,7 @@ This package is for [pgx/v5](https://pkg.go.dev/github.com/jackc/pgx/v5). A back
 
 | URL Query  | WithInstance Config | Description |
 |------------|---------------------|-------------|
+| `x-dsql-compatibility` | `DSQLCompatibility` | Translate DSQL ASYNC keywords for PostgreSQL tests (default: false) |
 | `x-migrations-table` | `MigrationsTable` | Name of the migrations table |
 | `x-migrations-table-quoted` | `MigrationsTableQuoted` | By default, migrate quotes the migration table for SQL injection safety reasons. This option disable quoting and naively checks that you have quoted the migration table name. e.g. `"my_schema"."schema_migrations"` |
 | `x-statement-timeout` | `StatementTimeout` | Abort any statement that takes more than the specified number of milliseconds |
@@ -39,3 +40,18 @@ In PostgreSQL running multiple SQL statements in one `Exec` executes them inside
 behavior is not desirable because some statements can be only run outside of transaction (e.g.
 `CREATE INDEX CONCURRENTLY`). If you want to use `CREATE INDEX CONCURRENTLY` without activating multi-statement mode
 you have to put such statements in a separate migration files.
+
+## DSQL compatibility for tests
+
+Glasswaves maintains this fork with the DSQL driver from upstream PR #1449 at
+`6518c5aa2d00aedccd6a20b3cb33151c1a4c57f7`. The upstream module path is retained.
+
+Use `pgx5://...?...&x-dsql-compatibility=true` or `Config{DSQLCompatibility: true}`
+to execute the same migration files against disposable PostgreSQL. It removes
+only the ASYNC keyword after CREATE [UNIQUE] INDEX and ALTER TABLE, preserving
+comments, strings, quoted identifiers and dollar-quoted bodies. SQL offsets and
+newlines are retained. Other unsupported SQL fails normally. The default driver
+behavior is unchanged. This mode does not emulate IAM, OCC, or asynchronous job
+execution; validate migrations against real DSQL as well. Prefer one DDL
+statement per file. Semicolon-based multi-statement splitting remains optional
+and cannot safely split semicolons inside literals.
