@@ -8,12 +8,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
 // Aurora DSQL has no local, Docker or Testcontainers image, so these tests run against a real
@@ -793,4 +795,88 @@ func newMigrator(t *testing.T, d *DSQL) *migrate.Migrate {
 	// The examples build an index, so give the lock and the jobs room.
 	m.LockTimeout = 30 * time.Second
 	return m
+}
+
+// Exercise batching through migrate itself: successful builds precede dependent
+// foreign keys, and a failed build must leave the migration dirty.
+func TestIntegrationIndexBatches(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		name := "success"
+		if fail {
+			name = "failed_build"
+		}
+		t.Run(name, func(t *testing.T) {
+			d := openScratch(t, "x-multi-statement=true", "x-async-index-batch-size=4", "x-occ-max-retries=5")
+			prefix := testPrefix(t)
+			table := d.qualifiedTable(prefix + "_items")
+			child := d.qualifiedTable(prefix + "_child")
+			mustExec(t, d, `CREATE TABLE `+table+` (id INT PRIMARY KEY, a INT, b INT)`)
+			values := `(1,1,1),(2,2,2)`
+			if fail {
+				values = `(1,1,1),(2,2,1)`
+			}
+			mustExec(t, d, `INSERT INTO `+table+` VALUES `+values)
+			sql := `CREATE INDEX ASYNC ` + prefix + `_a ON ` + table + ` (a);` +
+				`CREATE UNIQUE INDEX ASYNC ` + prefix + `_b ON ` + table + ` (b);` +
+				`CREATE TABLE ` + child + ` (id INT PRIMARY KEY, b INT REFERENCES ` + table + `(b));`
+			src, err := iofs.New(fstest.MapFS{
+				"1_indexes.up.sql":   &fstest.MapFile{Data: []byte(sql)},
+				"1_indexes.down.sql": &fstest.MapFile{Data: []byte(`DROP TABLE ` + child + `; DROP INDEX ` + d.qualifiedTable(prefix+"_a") + `; DROP INDEX ` + d.qualifiedTable(prefix+"_b") + `;`)},
+			}, ".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := migrate.NewWithInstance("iofs", src, "dsql", d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := src.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			err = m.Up()
+			version, dirty, versionErr := m.Version()
+			if versionErr != nil || version != 1 || dirty != fail {
+				t.Fatalf("version=%d dirty=%v err=%v", version, dirty, versionErr)
+			}
+			if fail {
+				if err == nil || !strings.Contains(err.Error(), "duplicate") {
+					t.Fatalf("expected duplicate failure, got %v", err)
+				}
+				var children int
+				if err = d.db.QueryRow(`SELECT count(*) FROM information_schema.tables WHERE table_schema=$1 AND table_name=$2`, scratchSchema(t), prefix+"_child").Scan(&children); err != nil {
+					t.Fatal(err)
+				}
+				if children != 0 {
+					t.Fatal("dependent statement ran after failed batch")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = m.Up(); !errors.Is(err, migrate.ErrNoChange) {
+					t.Fatalf("repeat apply: %v", err)
+				}
+				if !indexIsValid(t, d, prefix+"_b") {
+					t.Fatal("clean migration has an invalid unique index")
+				}
+				if err = m.Down(); err != nil {
+					t.Fatal("down:", err)
+				}
+				if err = m.Up(); err != nil {
+					t.Fatal("reapply:", err)
+				}
+				if !indexIsValid(t, d, prefix+"_b") {
+					t.Fatal("reapplied unique index is invalid")
+				}
+
+			}
+			if !indexIsValid(t, d, prefix+"_a") {
+				t.Fatal("accepted sibling index was not awaited")
+			}
+			mustExec(t, d, `DROP TABLE IF EXISTS `+child)
+			mustExec(t, d, `DROP TABLE `+table)
+		})
+	}
 }

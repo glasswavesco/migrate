@@ -36,6 +36,7 @@ Driver options:
 | `x-statement-timeout` | `StatementTimeout` | none | Statement timeout in milliseconds |
 | `x-multi-statement` | `MultiStatementEnabled` | `false` | Split a file on literal `;` characters |
 | `x-multi-statement-max-size` | `MultiStatementMaxSize` | 10 MB | Maximum buffered statement size |
+| `x-async-index-batch-size` | `AsyncIndexBatchSize` | `0` (sequential) | Maximum consecutive index builds in flight; values above 1 require multi-statement mode |
 | `x-occ-max-retries` | `OCCMaxRetries` | `0` | OCC conflict retries |
 | `x-occ-max-retry-delay` | `OCCMaxRetryDelay` | `5000` | Maximum retry delay in milliseconds |
 
@@ -71,6 +72,21 @@ See the complete [example migrations](examples/migrations), including
   [unsupported PostgreSQL features](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-unsupported-features.html),
   and [database limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)
   before writing migrations.
+
+## Overlapping index builds
+
+With multi-statement mode enabled, set `x-async-index-batch-size=4` (or
+`Config.AsyncIndexBatchSize: 4`) to submit up to four consecutive `CREATE INDEX ASYNC`
+statements before waiting. Zero and one retain sequential execution. Each statement
+still commits separately and in file order. Every non-index statement, `CREATE INDEX
+ASYNC IF NOT EXISTS`, and the end of the file waits for pending builds. This preserves
+dependencies such as a foreign key requiring a preceding unique index.
+
+The driver checks every accepted job, including after a later submission or parse
+failure. It never replays an accepted job. A failed build fails the migration and
+leaves its version dirty. Normal operator investigation is still required after a
+failure; batching does not make partially applied DDL atomic or recover it automatically.
+The existing statement timeout covers submission, not the build wait.
 
 ## Development
 
