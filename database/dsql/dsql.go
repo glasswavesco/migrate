@@ -130,6 +130,11 @@ type Config struct {
 	MultiStatementEnabled bool
 	MultiStatementMaxSize int
 
+	// AsyncIndexBatchSize bounds consecutive index builds in flight in multi-statement
+	// mode. Zero or one preserves sequential execution. Other statements and the end
+	// of a migration always wait for pending builds.
+	AsyncIndexBatchSize int
+
 	// OCC conflict retry. Classification, backoff and the meaning of these values are the
 	// connector's; occConfig hands them over unchanged.
 	//
@@ -253,6 +258,12 @@ func newDriver(instance *sql.DB, config *Config) (*DSQL, error) {
 // so a negative skips the statement and reports retries exhausted. setDefaults clamps the
 // rest, and the remaining fields report at first use.
 func (c *Config) validate() error {
+	if c.AsyncIndexBatchSize < 0 {
+		return fmt.Errorf("AsyncIndexBatchSize must not be negative, got %d", c.AsyncIndexBatchSize)
+	}
+	if c.AsyncIndexBatchSize > 1 && !c.MultiStatementEnabled {
+		return errors.New("AsyncIndexBatchSize greater than one requires MultiStatementEnabled")
+	}
 	if c.OCCMaxRetries < 0 {
 		return fmt.Errorf("OCCMaxRetries must not be negative, got %d", c.OCCMaxRetries)
 	}
@@ -486,6 +497,14 @@ func parseConfig(purl *nurl.URL) (*Config, error) {
 		multiStatementMaxSize = DefaultMultiStatementMaxSize
 	}
 
+	asyncIndexBatchSize, err := parseInt(query, "x-async-index-batch-size", 0)
+	if err != nil {
+		return nil, err
+	}
+	if asyncIndexBatchSize < 0 {
+		return nil, fmt.Errorf("x-async-index-batch-size must not be negative, got %d", asyncIndexBatchSize)
+	}
+
 	occMaxRetries, err := parseInt(query, "x-occ-max-retries", DefaultOCCMaxRetries)
 	if err != nil {
 		return nil, err
@@ -523,6 +542,7 @@ func parseConfig(purl *nurl.URL) (*Config, error) {
 		StatementTimeout:      time.Duration(statementTimeout) * time.Millisecond,
 		MultiStatementEnabled: multiStatementEnabled,
 		MultiStatementMaxSize: multiStatementMaxSize,
+		AsyncIndexBatchSize:   asyncIndexBatchSize,
 		OCCMaxRetries:         occMaxRetries,
 		OCCMaxRetryDelay:      time.Duration(occMaxRetryDelay) * time.Millisecond,
 	}, nil
@@ -768,18 +788,7 @@ func (d *DSQL) Run(migration io.Reader) error {
 	ctx := context.Background()
 
 	if d.config.MultiStatementEnabled {
-		// Nothing wraps this loop; each piece carries its own retry, inside applyStatement.
-		//
-		// The splitter is a plain byte search for ";" with no SQL awareness, so it breaks
-		// dollar-quoted bodies, string literals and comments. Hence off by default.
-		var runErr error
-		if err := multistmt.Parse(migration, multiStmtDelimiter, d.config.MultiStatementMaxSize, func(statement []byte) bool {
-			runErr = d.applyStatement(ctx, statement)
-			return runErr == nil
-		}); err != nil {
-			return err
-		}
-		return runErr
+		return d.runStatements(ctx, migration)
 	}
 
 	statement, err := io.ReadAll(migration)
@@ -787,6 +796,56 @@ func (d *DSQL) Run(migration io.Reader) error {
 		return err
 	}
 	return d.applyStatement(ctx, statement)
+}
+
+// runStatements submits index builds in bounded groups. Statements still commit in
+// file order, one transaction apiece; only the server-side builds overlap. Every
+// non-index statement is a dependency barrier. IF NOT EXISTS is also a barrier:
+// its validity check must not observe an earlier, still-building index in this file.
+func (d *DSQL) runStatements(ctx context.Context, migration io.Reader) error {
+	type pendingIndex struct {
+		statement []byte
+		jobID     string
+	}
+	var pending []pendingIndex
+	wait := func() error {
+		var errs []error
+		for _, index := range pending {
+			if err := d.awaitAsyncJob(ctx, index.jobID); err != nil {
+				errs = append(errs, migrationError(index.statement, err))
+			}
+		}
+		pending = nil
+		return errors.Join(errs...)
+	}
+	var runErr error
+	parseErr := multistmt.Parse(migration, multiStmtDelimiter, d.config.MultiStatementMaxSize, func(statement []byte) bool {
+		normalized := strings.TrimSpace(replaceComments(string(statement)))
+		batchable := d.config.AsyncIndexBatchSize > 1 && asyncIndexPattern.MatchString(normalized) &&
+			!asyncIndexIfNotExistsPattern.MatchString(normalized)
+		if !batchable {
+			if runErr = wait(); runErr == nil {
+				runErr = d.applyStatement(ctx, statement)
+			}
+			return runErr == nil
+		}
+		var jobID string
+		jobID, runErr = d.submitStatement(ctx, statement)
+		if runErr != nil {
+			return false
+		}
+		if jobID != "" {
+			// The splitter reuses its buffer. Retain the SQL for any later build error.
+			pending = append(pending, pendingIndex{statement: append([]byte(nil), statement...), jobID: jobID})
+		}
+		if len(pending) >= d.config.AsyncIndexBatchSize {
+			runErr = wait()
+		}
+		return runErr == nil
+	})
+	// Even after a submission or parsing error, collect results for accepted jobs.
+	// Never replay them or return success while any submitted build is unverified.
+	return errors.Join(runErr, parseErr, wait())
 }
 
 // applyStatement runs one statement to completion, which for a statement that enqueues an
@@ -798,21 +857,16 @@ func (d *DSQL) Run(migration io.Reader) error {
 // wait out here too — CREATE INDEX ASYNC runs inside a transaction block, while CALL
 // sys.wait_for_job answers 0A000 there.
 //
-// The wait is unconditional: Run returns once the job is finished, which is what lets the version
+// Completion is unconditional: Run returns once all its jobs are finished, which is what lets the version
 // migrate then marks clean describe the schema it has. Run returning is migrate's signal that the
 // migration applied, and it clears the dirty flag immediately afterwards with nothing in between
 // (migrate.go). Waiting is also what surfaces a build that failed, while sys.jobs still holds it —
 // terminal rows survive at least 30 minutes. A failed CREATE INDEX ASYNC leaves the index INVALID,
 // and a unique one goes on enforcing uniqueness until it is dropped.
 func (d *DSQL) applyStatement(ctx context.Context, statement []byte) error {
-	var jobID string
-	err := d.retry(ctx, func() error {
-		var runErr error
-		jobID, runErr = d.runStatement(ctx, statement)
-		return runErr
-	})
+	jobID, err := d.submitStatement(ctx, statement)
 	if err != nil {
-		return migrationError(statement, err)
+		return err
 	}
 	if jobID == "" {
 		return nil
@@ -821,6 +875,20 @@ func (d *DSQL) applyStatement(ctx context.Context, statement []byte) error {
 		return migrationError(statement, err)
 	}
 	return nil
+}
+
+// submitStatement retries only submission; an accepted asynchronous job is never replayed.
+func (d *DSQL) submitStatement(ctx context.Context, statement []byte) (string, error) {
+	var jobID string
+	err := d.retry(ctx, func() error {
+		var runErr error
+		jobID, runErr = d.runStatement(ctx, statement)
+		return runErr
+	})
+	if err != nil {
+		return "", migrationError(statement, err)
+	}
+	return jobID, nil
 }
 
 // migrationError adds migrate's context to a failure from one statement, reporting the line the

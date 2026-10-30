@@ -7,6 +7,7 @@ require (
 	cloud.google.com/go/storage v1.56.0
 	github.com/Azure/go-autorest/autorest/adal v0.9.16
 	github.com/ClickHouse/clickhouse-go v1.4.3
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/aws/aws-sdk-go v1.49.6
 	github.com/awslabs/aurora-dsql-connectors/go/pgx v0.5.0
 	github.com/cenkalti/backoff/v4 v4.1.2
