@@ -830,7 +830,11 @@ func TestIntegrationIndexBatches(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { src.Close() })
+			t.Cleanup(func() {
+				if err := src.Close(); err != nil {
+					t.Error(err)
+				}
+			})
 			err = m.Up()
 			version, dirty, versionErr := m.Version()
 			if versionErr != nil || version != 1 || dirty != fail {

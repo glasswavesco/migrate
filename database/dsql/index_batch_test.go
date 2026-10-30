@@ -121,7 +121,7 @@ func TestRunIndexBatches(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { db.Close() })
+			t.Cleanup(func() { _ = db.Close() })
 			cfg := &Config{MultiStatementEnabled: true, MultiStatementMaxSize: 4096, AsyncIndexBatchSize: tc.size, OCCMaxRetries: 1, OCCMaxRetryDelay: 1}
 			cfg.setDefaults()
 			d := &DSQL{db: db, config: cfg}
